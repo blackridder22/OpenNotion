@@ -12,5 +12,5 @@ ev=[o for o in ev if "t" in o]; t0=ev[0]["t"]
 for o in ev:
     k=o['kind']
     if k=='mark': print(f"\n=== {o['t']-t0:>6} MARK {o['label']}")
-    elif k=='http': print(f"{o['t']-t0:>6} HTTP {o['url'].split('/api/v3/')[1]} req={len(o.get('req') or '')} res={len(o.get('res') or '')}")
+    elif k=='http': print(f"{o['t']-t0:>6} HTTP {o.get('method','POST')} {o['url'].split('/api/v3/')[-1]} req={len(o.get('req') or '')} res={len(o.get('res') or '')}")
     elif k=='ws': print(f"{o['t']-t0:>6} WS {o['dir']} {o['host']} {o['d'][:150]}")

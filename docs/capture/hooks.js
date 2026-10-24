@@ -1,5 +1,5 @@
 // Paste into the DevTools console of a Notion tab opened from collector.py's OPEN button.
-// Wraps fetch, XHR and WebSocket.send so every /api/v3 call and every websocket frame
+// Wraps fetch, XHR and WebSocket.send so every API call (including direct S3 uploads) and every websocket frame
 // (both directions) is posted to the collector page. Cookies and auth headers are dropped.
 // mark('label') inserts a marker so the timeline shows which action caused which traffic.
 (() => {
@@ -10,21 +10,23 @@
   window.fetch = async function (input, init) {
     const url = typeof input === 'string' ? input : input.url;
     const res = await realFetch.apply(this, arguments);
-    if (url.includes('/api/v3/')) {
+    if (!/\/_assets\/|\.(js|css)$/.test(url)) {
       res.clone().text().then((body) => send('http', {
         t: Date.now(), url: url.split('?')[0], q: url.split('?')[1] || '',
-        reqHeaders: headers(init && init.headers), req: init && init.body, status: res.status, res: body,
+        method: (init && init.method) || 'GET', reqHeaders: headers(init && init.headers), req: init && typeof init.body === 'string' ? init.body : init && init.body ? '[binary body]' : null, status: res.status, res: body,
       })).catch(() => {});
     }
     return res;
   };
 
   const open = XMLHttpRequest.prototype.open, xsend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function (m, u) { this.__url = u; return open.apply(this, arguments); };
+  XMLHttpRequest.prototype.open = function (m, u) { this.__url = u; this.__method = m; return open.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (b) {
-    if (String(this.__url).includes('/api/v3/')) {
-      this.addEventListener('load', () => send('http', { t: Date.now(), url: String(this.__url).split('?')[0], req: b, status: this.status, res: this.responseText, xhr: true }));
-    }
+    this.addEventListener('load', () => send('http', {
+      t: Date.now(), method: this.__method, url: String(this.__url).split('?')[0], xhr: true, status: this.status,
+      req: typeof b === 'string' ? b : b ? '[binary body]' : null,
+      res: this.responseType === '' || this.responseType === 'text' ? this.responseText : `[${this.responseType}]`,
+    }));
     return xsend.apply(this, arguments);
   };
 

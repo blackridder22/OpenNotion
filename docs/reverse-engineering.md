@@ -60,7 +60,7 @@ Ordering is kept on the child (`position`) rather than as an id array on the par
 
 ## Live capture of the web app (October 2026)
 
-The first pass above only had community npm packages to go on. This pass watched the real web app in Chrome, logged in, on a throwaway private page, with two tabs open on the same page so one tab could watch the other's edits arrive. Every `/api/v3` call and every websocket frame in both directions was recorded with the scripts in [`docs/capture/`](capture/) (see "Rerunning the capture" below). The scenarios were: create a page, type a title and a paragraph, append text, a heading via `## `, a to-do via `[] `, indent with Tab, tick a checkbox from the other tab, both tabs typing into the same paragraph at once, delete a nested block with Backspace, a simulated network outage while typing, and navigating away and back.
+The first pass above only had community npm packages to go on. This pass watched the real web app in Chrome, logged in, on a throwaway private page, with two tabs open on the same page so one tab could watch the other's edits arrive. Every `/api/v3` call and every websocket frame in both directions was recorded with the scripts in [`docs/capture/`](capture/) (see "Rerunning the capture" below). The scenarios were: create a page, type a title and a paragraph, append text, a heading via `## `, a to-do via `[] `, indent with Tab, tick a checkbox from the other tab, both tabs typing into the same paragraph at once, delete a nested block with Backspace, a simulated network outage while typing, and navigating away and back. A second session added drag-to-move, undo and redo, a comment and resolving it, an inline database (property, row, select value, sort), an image upload, and opening the share menu.
 
 Client version at capture time: `notion-client-version: 23.13.20261024.1856`.
 
@@ -212,10 +212,71 @@ The token comes from `getPresenceAuthorizationToken` over HTTP, so the realtime 
 
 With `saveTransactions` forced to fail for 10 seconds while typing a new block, the client kept editing locally, retried about every 5 seconds, and on recovery sent everything in one request (about 20 KB, every keystroke transaction kept). Tab A then received the version notifications and showed the text. Nothing was lost and no conflict UI appeared.
 
+### Drag to move, undo and redo
+
+**Drag a block** (`userAction: ListItemBlock.handleDrop`): `update { alive: false }`, `listRemove ["content"] { id }`, then `insertChildrenAfter ["content"] { ids: [id], after }` on the target parent. `insertChildrenAfter` takes a list of ids, so a multi-block drag is presumably one op.
+
+**Undo** (`cmd+z`) does not replay history on the server. The client builds an inverse transaction and sends it like any other edit, flagged with `isUndoTransaction: true` and `userAction: revisionActions.performUndoRedoRevisionTransaction`:
+
+- Undoing the drag sent `removeChild ["content"]`, `listAfter ["content"] { id, after: <original neighbour> }` and `update { alive: true }`.
+- Undoing typed text sent one `deleteText` per character, by CRDT id, newest first. Redo re-sent the characters as `insertText`.
+
+So undo is local and per client: each tab only undoes its own edits, and the server just sees normal ops.
+
+### Comments
+
+Selecting a word and adding a comment sends one transaction (`newDiscussionMenuActions.submitNewDiscussion`) that touches five record types:
+
+| Op | Meaning |
+| --- | --- |
+| `block addAnnotation { textInstanceId, id, start: { id, anchor: "before" }, end: { id, anchor: "after" }, annotation: ["m", <discussionId>] }` | marks the commented range inside the CRDT text, anchored to character ids, so the highlight survives edits around it |
+| `discussion update { type: "default", parent_id: <blockId>, parent_table: "block", resolved: false, context: [["Hello", [["m", <discussionId>]]]], space_id }` | the thread; `context` keeps a snapshot of the quoted text |
+| `comment set { id, parent_id: <discussionId>, parent_table: "discussion", alive, ... }` then `comment set ["text"] [["test comment"]]` | the comment, with old-style rich text (not CRDT) |
+| `discussion listAfter ["comments"]`, `block listAfter ["discussions"]` | ordered id lists on the parent, like `content` |
+| `user_seen_record update { last_seen_at, subscription_state: "subscribed" }` | read state and notification subscription for the author |
+
+Resolving is a single `discussion update { resolved: true }`. The socket then carries `versions/<id>:discussion:<id>`, `versions/<id>:comment:<id>` and `versions/<id>:follow:<id>` notifications.
+
+### Databases
+
+Notion calls a database a `collection`, and each saved view a `collection_view`. Inserting an inline database (`/database inline`) created three records in one transaction:
+
+```text
+block           set { type: "collection_view", collection_id, view_ids: [<viewId>], format: { collection_pointer: { table: "collection", id, spaceId } } }
+collection      set { id, format: {}, parent_id: <that block>, parent_table: "block", alive: true }
+collection_view set { id, type: "table", format: { collection_pointer, table_properties: [{ property: "title", visible, width }], table_wrap: true }, page_sort: [], parent_id: <that block>, parent_table: "block" }
+collection      updateCollectionPropertySchema ["schema"] { primitiveOp: { command: "update", args: { "title": { name: "Name", type: "title" } } } }
+```
+
+- **Schema** lives on the collection as `schema`, a map from a short random property id (e.g. `HA\=`, 4 characters) to `{ name, type }`. The title column always has the id `title`. Schema changes use `updateCollectionPropertySchema` with a nested `primitiveOp`, so a change to one property doesn't overwrite the rest of the schema.
+- **Adding a property** (type Select): `updateCollectionPropertySchema` with `{ "<propId>": { name: "Select", type: "select" } }`, plus `collection_view update ["format"] { table_properties: [...] }` to show the column in this view. Column visibility and width are per view.
+- **Adding a row** (`TableGroupResults.handleAddRowClick`): a row is just a `page` block whose parent is the collection: `block setParent { parentId: <collectionId>, parentTable: "collection" }`. Its order in the view is `collection_view listAfter ["page_sort"] { id }`, so manual row order is stored per view. This one request went to `saveTransactionsMain` instead of `saveTransactionsFanout`, together with a `user_settings` update to `lastUsedDatabases`.
+- **Setting a select value that doesn't exist yet**: one transaction adds the option to the schema (`updateCollectionPropertySchema ["schema", "<propId>", "options"]` with `primitiveOp: keyedObjectListAfter { value: { id, value: "Hot", color: "default" } }`) and sets the cell (`updateBlockPropertyValue ["properties", "<propId>"]` with `primitiveOp: set [["Hot"]]`). Cell values sit in the row block's `properties` under the property id, in the same rich-text array format as titles.
+- **Sorting a view**: `collection_view update ["query2"] { sort: [{ property: "title", direction: "ascending" }] }`. Filters live in the same `query2` object. The `userAction` was `collectionFilterActions.applyTemporaryStateIfPrivate`, which suggests that on shared databases a sort is first kept as a temporary state for that user only (inferred from the name).
+- **Querying**: the earlier page load of an existing database called `queryCollection?src=initial_load`. For this new database the client never called it and rendered the rows from records it already had locally.
+- The socket subscribed to `collection/<id>` and `versions/<id>:collection` / `versions/<id>:collection_view` alongside the block keys.
+
+### File upload
+
+Uploading an image is three steps:
+
+1. `POST /api/v3/getUploadSpaceFileUrl` with `{ bucket: "secure", name, contentType, contentLength, record: { table: "block", id, spaceId }, supportExtraHeaders: true, spaceId }`. The response contains `url: "attachment:<fileId>:test-image.png"`, a `signedGetUrl` on `file.notion.com/f/f/<spaceId>/<fileId>/<name>` (with an expiry timestamp and signature), and an S3 presigned POST: `signedUploadPostUrl` plus `fields` (key `<spaceId>/<fileId>/<name>`, storage class `INTELLIGENT_TIERING`, tags for the uploader and block).
+2. The browser posts the file straight to `prod-files-secure.s3.us-west-2.amazonaws.com` (status 204). Notion's servers never receive the bytes.
+3. A transaction on the image block: `update ["format"] { block_width, block_height, block_aspect_ratio, block_preserve_scale, ... }`, then `updateBlockPropertyValue ["properties"] { source: [["attachment:<fileId>:test-image.png"]], size: [["79 B"]] }` and `format.display_source`.
+
+The block stores the stable `attachment:` reference, not a URL; readable URLs are signed on demand (`getSignedFileUrls`, from the first pass).
+
+### Sharing
+
+Opening the Share menu called `getVisibleUsers`, `getSimilarUsers`, `getInternalDomains`, `getInternalPageGuestCount` and `getSubscriptionData`, plus a `syncRecordValuesSpaceInitial` for the page's permissions. The menu offers per-user roles and a "General access" setting with three levels: only invited people, everyone in the workspace, and anyone on the web with the link. Private pages store access in the block's `permissions` array (`user_permission` with a `role`), as seen when the page was created.
+
+I did not change general access: switching the test page to "anyone with the link" was blocked by a permission check in this session, and inviting someone would have emailed them. The operation that changes sharing is therefore not captured.
+
 ### What was not covered
 
-- Databases (`queryCollection`, views, property schemas), comments, sharing changes, file uploads, undo, and moving blocks by drag were not exercised.
-- Only one user (two tabs). Multi-user permissions were not observed.
+- Changing sharing (making a page public or inviting someone): see "Sharing" above.
+- Only one user (two tabs). Multi-user permission checks and what a second person's client receives were not observed.
+- Database filters, other view types (board, calendar), relations, rollups and formulas.
 - The local SQLite cache was seen loading but its tables were not inspected.
 - No Notion code was read. All of the above is from traffic on a page created for the test.
 
@@ -229,6 +290,10 @@ With `saveTransactions` forced to fail for 10 seconds while typing a new block, 
 | Records keep both `properties.title` and `crdt_data` | Keep the plain-text/JSON block content columns next to the Yjs state so search, previews and the share page don't need to load Yjs |
 | Presence is block-level, with a server-signed token | Hocuspocus awareness gives cursor-level presence for free; authorize the socket with a short-lived signed token issued by the Next.js app, like `getPresenceAuthorizationToken` |
 | Client caches pages locally (WASM SQLite) and queues writes | `y-indexeddb` gives the offline cache and replay; it can come after live editing works |
+| Undo is client-side inverse ops, per client | Yjs `UndoManager` with tracked origins does the same (each user undoes only their own changes) |
+| Comments anchor to CRDT character ids | Anchor comments with Yjs relative positions (`Y.createRelativePositionFromTypeIndex`) instead of offsets |
+| Uploads go browser to S3 with a presigned POST; blocks store `attachment:<id>` | Store a file id on the block and sign read URLs on demand, so links can expire and permissions apply |
+| Database schema is a map of short property ids; rows are pages with the collection as parent; order is per view | Fits a `collections` table with a JSON schema keyed by property id, rows as `pages` with `collection_id`, and per-view sort/filter JSON |
 
 ## Rerunning the capture
 
